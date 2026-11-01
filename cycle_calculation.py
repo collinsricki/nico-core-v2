@@ -9,6 +9,11 @@ from finance_worker import (UpFailure, date, identifier, money, normalize_transa
                             project, stamp, transaction, utcnow)
 
 
+# Accepted fact in the pinned budget_rules.SOURCE_HASH contract; not a payment
+# match or a future route. Do not infer it from an unmatched historical debit.
+ACCEPTED_CHATGPT_NEXT_RENEWAL = '2026-11-19'
+
+
 def schema(db):
     if db.execute('PRAGMA user_version').fetchone()[0] != 2:
         raise ValueError('Accepted core schema 2 required')
@@ -141,7 +146,7 @@ def calculate(db, document, evidence, report):
     """Extend the retained report; evidence declarations never substitute for API coverage."""
     from budget_rules import EvidenceError, occurrences, references
     proof = evidence.get('calculation', {})
-    if not isinstance(proof, dict) or set(proof) - {'runId', 'rowCoverage', 'routes', 'fundedElsewhere'}:
+    if not isinstance(proof, dict) or set(proof) - {'runId', 'rowCoverage', 'routes', 'fundedElsewhere', 'deferredContributions'}:
         raise EvidenceError('Unsupported calculation evidence')
     spending = report['up_spending']
     spending['conditional_gaps'] = gaps = []
@@ -191,11 +196,29 @@ def calculate(db, document, evidence, report):
     routes = proof.get('routes', {})
     coverage = proof.get('rowCoverage', {})
     funding = proof.get('fundedElsewhere', {})
-    if any(not isinstance(x, dict) for x in (routes, coverage, funding)) or (set(routes) | set(coverage) | set(funding)) - set(rows):
+    deferrals = proof.get('deferredContributions', {})
+    if any(not isinstance(x, dict) for x in (routes, coverage, funding, deferrals)) or (set(routes) | set(coverage) | set(funding) | set(deferrals)) - set(rows):
         raise EvidenceError('Evidence must reference accepted budget identities')
     def dated(item):
         references(item.get('provenance'))
         return run['through_at'] <= stamp(date(item['asOf'])) <= report['as_of']
+    for key, item in deferrals.items():
+        if (not isinstance(item, dict)
+                or set(item) != {'deferred', 'cycle', 'asOf', 'provenance'}
+                or item.get('deferred') is not True
+                or item.get('cycle') != {name: report['cycle'][name] for name in ('start', 'endExclusive')}
+                or originals[key].get('reserveClass') != 'provision_component_not_extra_expense'
+                or rows[key]['reserve_class'] != 'provision_component_not_extra_expense'
+                or not dated(item)
+                or any(x.get('budgetId') == key and x.get('scheduled')
+                       and report['cycle']['start'] <= x['scheduled'][:10] < report['cycle']['endExclusive']
+                       for x in occurrences(document))
+                or (key in funding and funding[key].get('funded') is True)):
+            raise EvidenceError('Deferral requires dated cycle-specific contribution authority without due bill or funding conflict')
+        rows[key]['contribution_state'] = 'OWNER_DEFERRED_THIS_CYCLE_ONLY'
+        rows[key]['deferred_contribution_target_minor'] = rows[key]['target_minor']
+        rows[key]['current_cycle_contribution_required_minor'] = 0
+        gaps.append('OWNER_DEFERRED_CURRENT_CYCLE_CONTRIBUTION:' + key)
     for budget_id, item in routes.items():
         if originals[budget_id]['bank'] != 'UNKNOWN_CURRENT_MAPPING' or not dated(item):
             raise EvidenceError('Only dated evidence may resolve an unknown route')
@@ -205,7 +228,18 @@ def calculate(db, document, evidence, report):
         rows[budget_id]['payment_account'] = role
     report['up_spending']['unresolved_current_merchant_mappings'] = [key for key, row in rows.items() if row['payment_account'] == 'UNKNOWN_CURRENT_MAPPING']
     for key in report['up_spending']['unresolved_current_merchant_mappings']:
-        gaps.append('UNRESOLVED_MERCHANT_ROUTE:' + key)
+        scheduled = [item['scheduled'][:10] for item in occurrences(document)
+                     if item.get('budgetId') == key and item.get('scheduled')]
+        outside_renewal = (key == 'chatgpt'
+            and ACCEPTED_CHATGPT_NEXT_RENEWAL >= report['cycle']['endExclusive']
+            and not any(report['cycle']['start'] <= due < report['cycle']['endExclusive']
+                        for due in scheduled))
+        if outside_renewal:
+            rows[key]['next_accepted_occurrence'] = ACCEPTED_CHATGPT_NEXT_RENEWAL
+            rows[key]['current_cycle_future_payment_reserve_minor'] = 0
+            gaps.append('OUTSIDE_CYCLE_RENEWAL_ROUTE_UNKNOWN:' + key)
+        else:
+            gaps.append('UNRESOLVED_MERCHANT_ROUTE:' + key)
     matches = report['matched_occurrences']
     aliases = {key for item in matches for key in item.get('resource_aliases', [item['resource_key']])}
     # Every movement needs classification. Unsupported credits/refunds cannot silently
@@ -266,6 +300,8 @@ def calculate(db, document, evidence, report):
             if not complete:
                 gaps.append('INCOMPLETE_ALL_BANK_CATEGORY:' + key)
         elif originals[key]['bank'] == 'UP' or row['payment_account'] in bound:
+            if key in deferrals:
+                continue  # Only this cycle's new contribution is deferred; retained cash is untouched.
             if row['reserve_class'] == 'upcoming_unique_bill_from_essentials' and paid and complete:
                 row['current_reserve_minor'] = 0
             elif key not in funding or not dated(funding[key]) or funding[key].get('funded') is not True:
@@ -317,7 +353,8 @@ def calculate(db, document, evidence, report):
         gaps.append('DEDUCTION_UNKNOWN')
     gaps[:] = sorted(set(gaps))
     qualification_prefixes = ('INCOMPLETE_ALL_BANK_CATEGORY:', 'UNCLASSIFIED_REFLECTED_UP_HOLD:',
-                              'FULL_ACCEPTED_ALLOCATION_FUNDING_CHECK:')
+                              'FULL_ACCEPTED_ALLOCATION_FUNDING_CHECK:', 'OUTSIDE_CYCLE_RENEWAL_ROUTE_UNKNOWN:',
+                              'OWNER_DEFERRED_CURRENT_CYCLE_CONTRIBUTION:')
     spending['qualifications'] = [x for x in gaps if x.startswith(qualification_prefixes)]
     spending['arithmetic_blockers'] = [x for x in gaps if not x.startswith(qualification_prefixes)]
     spending['known_deductions_subtotal_minor'] = sum(x['amount_minor'] for x in deductions if finite_minor(x['amount_minor']))
