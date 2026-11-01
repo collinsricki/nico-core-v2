@@ -196,15 +196,18 @@ def matched_occurrences(connection, document, evidence, as_of):
         source = match.get("source")
         kind = match.get("kind")
         identity = match.get("transactionId")
-        if source not in ("UP", "COMMBANK", "LEGACY") or kind not in ("EXPENSE", "INTERNAL_TRANSFER") or not isinstance(identity, str) or not identity:
+        if source not in ("UP", "COMMBANK", "LEGACY") or kind not in ("EXPENSE", "INTERNAL_TRANSFER", "NON_BUDGET_CREDIT") or not isinstance(identity, str) or not identity:
             raise EvidenceError("Invalid explicit match source/type/identity")
+        if kind == "NON_BUDGET_CREDIT" and (source != "UP" or budget_id is not None):
+            raise EvidenceError("Nonbudget credit requires an explicit unbudgeted Up identity")
         if source == "UP":
             row = connection.execute("SELECT * FROM transactions WHERE transaction_id=?", (identity,)).fetchone()
             if not row or row["is_deleted"] or row["ordering_conflict"] or stamp(date(row["last_observed_at"])) > as_of:
                 unresolved.append({"occurrence_id": occurrence_id, "reason": "UP_RECORD_MISSING_DELETED_CONFLICTED_OR_FUTURE"})
                 continue
             if (row["currency_code"] != "AUD" or row["amount_base_units"] is None
-                    or (row["amount_base_units"] > 0 and kind != "INTERNAL_TRANSFER")):
+                    or (row["amount_base_units"] > 0 and kind not in ("INTERNAL_TRANSFER", "NON_BUDGET_CREDIT"))
+                    or (kind == "NON_BUDGET_CREDIT" and row["amount_base_units"] <= 0)):
                 unresolved.append({"occurrence_id": occurrence_id, "reason": "UNRESOLVED_CURRENCY_OR_CREDIT"})
                 continue
             amount, status = abs(row["amount_base_units"]), row["up_status"]
@@ -244,7 +247,7 @@ def matched_occurrences(connection, document, evidence, as_of):
 
 
 def calculate(connection, document, evidence, as_of):
-    if not isinstance(evidence, dict) or set(evidence) - {"schema", "bindings", "matches", "cardObservation"}:
+    if not isinstance(evidence, dict) or set(evidence) - {"schema", "bindings", "matches", "cardObservation", "calculation"}:
         raise EvidenceError("Unrecognised evidence input fields")
     if evidence.get("schema", "nico-budget-evidence/v1") != "nico-budget-evidence/v1":
         raise EvidenceError("Unsupported evidence contract")
@@ -323,7 +326,7 @@ def calculate(connection, document, evidence, as_of):
         card_observation = {key: card_observation[key] for key in ("availableCreditMinor", "currency", "asOf", "provenance")}
     dated = document["datedRegressionIdentityNotCurrentAdvice"]
     totals = [x["conditional_planning_protection_minor"] for x in components]
-    return {"schema": "nico-budget-report/v1", "source_hash": SOURCE_HASH, "as_of": as_of, "cycle": CYCLE,
+    report = {"schema": "nico-budget-report/v1", "source_hash": SOURCE_HASH, "as_of": as_of, "cycle": CYCLE,
         "qualification": "QUALIFIED_COMPONENTS_ONLY_NOT_CURRENT_ASSURED_SPENDING",
         "cycle_is_explicit_not_rolling": True, "cycle_timezone": "NOT_INFERRED",
         "allocation_total_minor": 667091, "allocation_is_cash_requirement": False,
@@ -346,6 +349,8 @@ def calculate(connection, document, evidence, as_of):
         "unbound_roles": sorted({"up.spending", "up.essentials"} - set(bound)),
         "source_dates_and_provenance": {"remaining_inputs": document["remainingDataInputs"], "evidence": document["evidence"]},
         "no_automatic_actions": True}
+    from cycle_calculation import calculate as conditional_calculate
+    return conditional_calculate(connection, document, evidence, report)
 
 
 def persist_report(factory, evidence, as_of):
@@ -368,11 +373,34 @@ def main():
     parser.add_argument("--rules", required=True, type=Path)
     parser.add_argument("--evidence-json", type=Path, help="Optional existing verified bindings/joins and dated card evidence")
     parser.add_argument("--as-of", default=stamp(datetime.now(timezone.utc)))
+    parser.add_argument("--catch-up", action="store_true", help="Explicit read-only current-cycle collection; never runs at startup")
+    parser.add_argument("--cycle-start-at", help="Approved 14 October local midnight with explicit RFC3339 offset")
+    parser.add_argument("--cycle-end-at", help="Approved 15 November local midnight with explicit RFC3339 offset")
+    parser.add_argument("--resume-catchup", help="Resume a retained bounded collection checkpoint")
     args = parser.parse_args()
     from main import open_database
     factory = lambda: open_database(Path("/data"), True)
-    result = import_rules(factory, args.rules.read_bytes(), datetime.now(timezone.utc))
     evidence = json.loads(args.evidence_json.read_text()) if args.evidence_json else {}
+    if args.catch_up:
+        if not args.cycle_start_at or not args.cycle_end_at or not evidence.get("bindings"):
+            parser.error("Catch-up requires explicit cycle offsets and verified evidence bindings")
+        from cycle_calculation import boundaries, catch_up
+        boundaries(args.cycle_start_at, args.cycle_end_at)
+        token = os.environ.get("UP_PAT")
+        if not token:
+            parser.error("UP_PAT required for explicit read-only catch-up")
+        from finance_worker import UpClient
+        client = UpClient(token)
+        try:
+            receipt = catch_up(factory, client, evidence["bindings"], args.cycle_start_at,
+                               args.cycle_end_at, resume=args.resume_catchup)
+        finally:
+            client.close()
+        print(canonical(receipt))
+        return  # Collection and report publication are separate explicit operations.
+    if args.resume_catchup or args.cycle_start_at or args.cycle_end_at:
+        parser.error("Cycle collection arguments require --catch-up")
+    result = import_rules(factory, args.rules.read_bytes(), datetime.now(timezone.utc))
     report_id, report = persist_report(factory, evidence, args.as_of)
     output = Path("/data/nico-ingress") / ("budget-report-" + report_id + ".json")
     data = canonical(report).encode()
