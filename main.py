@@ -1,6 +1,7 @@
 """Authenticated, durable Up event intake only; no financial processing."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -15,6 +16,8 @@ from uuid import UUID
 from fastapi import FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
+
+from finance_worker import FinanceWorker, UpClient
 
 MAX_BODY_BYTES = 64 * 1024
 BODY_TIMEOUT_SECONDS = 5
@@ -81,8 +84,8 @@ def _private_path(path, directory=False):
         raise OSError("Storage permissions must be private")
 
 
-def store_event(storage_root, require_mount, event, raw):
-    """Commit before returning; retries never overwrite existing event bytes."""
+def open_database(storage_root, require_mount):
+    """Shared private persistent storage; no ephemeral fallback."""
     if not storage_root.is_dir() or storage_root.is_symlink():
         raise OSError("Persistent storage unavailable")
     if require_mount and (storage_root != Path("/data") or not os.path.ismount(storage_root)):
@@ -104,6 +107,17 @@ def store_event(storage_root, require_mount, event, raw):
             raise sqlite3.OperationalError("WAL unavailable")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def store_event(storage_root, require_mount, event, raw):
+    """Commit before returning; retries never overwrite existing event bytes."""
+    connection = open_database(storage_root, require_mount)
+    try:
         connection.execute("BEGIN IMMEDIATE")
         connection.execute("""
             CREATE TABLE IF NOT EXISTS webhook_events (
@@ -143,14 +157,34 @@ def store_event(storage_root, require_mount, event, raw):
         connection.close()
 
 
-def create_app(*, storage_root=Path("/data"), require_mount=True, secret_provider=None):
+def create_app(*, storage_root=Path("/data"), require_mount=True, secret_provider=None,
+               enable_worker=True, up_client_factory=None):
     """Storage overrides are explicit test injection, never environment fallbacks."""
-    application = FastAPI(title="Nico Mercer Core")
+
+    def configured_client():
+        token = os.environ.get("UP_PAT")
+        return UpClient(token) if token and token.strip() else None
+
+    @asynccontextmanager
+    async def lifespan(application):
+        worker = None
+        if enable_worker:
+            worker = FinanceWorker(lambda: open_database(storage_root, require_mount),
+                                   up_client_factory or configured_client)
+            application.state.finance_worker = worker
+            worker.start()
+        try:
+            yield
+        finally:
+            if worker:
+                await run_in_threadpool(worker.stop)
+
+    application = FastAPI(title="Nico Mercer Core", lifespan=lifespan)
     write_lock = asyncio.Lock()
 
     @application.get("/")
     def read_root():
-        return {"status": "alive", "financial_processing": "not_implemented"}
+        return {"status": "alive", "financial_processing": "not_commissioned"}
 
     @application.post("/webhooks/upbank")
     async def handle_upbank(request: Request):
