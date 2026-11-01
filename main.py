@@ -235,6 +235,9 @@ def create_app(*, storage_root=Path("/data"), require_mount=True, secret_provide
             write_lock.release()
         return {"status": "PENDING", "duplicate": duplicate}
 
+    from finance_summary import install_summary_route
+    install_summary_route(application, storage_root=storage_root, require_mount=require_mount)
+
     return application
 
 
