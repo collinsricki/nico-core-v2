@@ -146,7 +146,7 @@ def calculate(db, document, evidence, report):
     """Extend the retained report; evidence declarations never substitute for API coverage."""
     from budget_rules import EvidenceError, occurrences, references
     proof = evidence.get('calculation', {})
-    if not isinstance(proof, dict) or set(proof) - {'runId', 'rowCoverage', 'routes', 'fundedElsewhere', 'deferredContributions'}:
+    if not isinstance(proof, dict) or set(proof) - {'runId', 'rowCoverage', 'routes', 'fundedElsewhere', 'deferredContributions', 'priorPlanningAllocations', 'pendingCommitmentObservations'}:
         raise EvidenceError('Unsupported calculation evidence')
     spending = report['up_spending']
     spending['conditional_gaps'] = gaps = []
@@ -332,9 +332,15 @@ def calculate(db, document, evidence, report):
     for role, amount in funded_totals.items():
         if bound[role] not in accounts or accounts[bound[role]]['balance_minor'] < amount:
             gaps.append('PROTECTED_ACCOUNT_UNDERFUNDED:' + role)
+    from planning_report import prior_allocations, finish
+    planning_adjustments, retained_allocations = prior_allocations(proof, report, run['through_at'])
     # Reuse accepted component arithmetic; paid/held invoice reflects the observed balance.
     for component in spending['planning_components']:
         value = component['conditional_planning_protection_minor']
+        if component['id'] in planning_adjustments:
+            component['unadjusted_planning_protection_minor'] = value
+            component['accepted_prior_category_allocation_minor'] = planning_adjustments[component['id']]
+            value = max(0, value - planning_adjustments[component['id']]) if finite_minor(value) else None
         if component['id'] == '1password-current-invoice':
             found = next((x for x in matches if x['occurrence_id'] == 'supplemental:1password-current-invoice' and x['kind'] == 'EXPENSE'), None)
             if found:
@@ -374,4 +380,4 @@ def calculate(db, document, evidence, report):
         spending['conditional_cash_room_minor'] = None
     report['actual_total_minor'] = sum(x['actual_minor'] for x in rows.values()) if all(x['actual_minor'] is not None for x in rows.values()) else None
     report['remaining_total_minor'] = sum(x['remaining_minor'] for x in rows.values()) if all(x['remaining_minor'] is not None for x in rows.values()) else None
-    return report
+    return finish(proof, document, report, run['through_at'], retained_allocations)
