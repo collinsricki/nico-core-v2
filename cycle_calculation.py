@@ -139,7 +139,7 @@ def catch_up(factory, client, bindings, start, end, clock=utcnow, resume=None):
 
 def calculate(db, document, evidence, report):
     """Extend the retained report; evidence declarations never substitute for API coverage."""
-    from budget_rules import EvidenceError, references
+    from budget_rules import EvidenceError, occurrences, references
     proof = evidence.get('calculation', {})
     if not isinstance(proof, dict) or set(proof) - {'runId', 'rowCoverage', 'routes', 'fundedElsewhere'}:
         raise EvidenceError('Unsupported calculation evidence')
@@ -217,6 +217,9 @@ def calculate(db, document, evidence, report):
     if report['unresolved_matches']:
         gaps.append('UNRESOLVED_OCCURRENCE_MATCHES')
     ledger_complete = not any(x.startswith(('TRANSACTION_CHANGED_OR_UNRESOLVED:', 'UNCLASSIFIED_UP_', 'UNRESOLVED_OCCURRENCE_MATCHES')) for x in gaps)
+    accepted_old = {x['budgetId']: x for x in occurrences(document)
+                    if x['kind'] == 'OLD_BANK_PAID' and x['budgetId'] in ('rent', 'tesla-payment')}
+    satisfied_old = set()
     for key, row in rows.items():
         complete = ledger_complete and key in coverage and coverage[key].get('complete') is True and dated(coverage[key])
         row['coverage'] = 'COMPLETE_EXPLICIT_ALL_BANK_ROW_EVIDENCE' if complete else row['coverage']
@@ -225,8 +228,19 @@ def calculate(db, document, evidence, report):
             row['remaining_minor'] = max(0, row['target_minor'] - row['actual_minor'])
         # A full satisfied unique bill is not an unspent allocation to reserve again.
         paid = any(x['budget_id'] == key and x['kind'] == 'EXPENSE' and x['status'] in ('POSTED','SETTLED') for x in matches)
+        accepted = accepted_old.get(key)
+        paid_old_outside_next = (accepted is not None
+            and originals[key].get('nextScheduled', '')[:10] >= report['cycle']['endExclusive']
+            and any(x['budget_id'] == key and x['occurrence_id'] == accepted['id']
+                    and x['resource_key'] == 'LEGACY:' + accepted['transactionId']
+                    and x['amount_minor'] == accepted['amountMinor']
+                    and x['kind'] == 'EXPENSE' and x['status'] in ('POSTED', 'SETTLED')
+                    for x in matches))
         if row['reserve_class'] == 'inactive_zero':
             row['current_reserve_minor'] = 0
+        elif paid_old_outside_next:
+            row['current_reserve_minor'] = 0
+            satisfied_old.add(key)
         elif row['payment_account'] == 'up.spending':
             row['current_reserve_minor'] = row['remaining_minor'] if complete else None
             if not complete:
@@ -238,6 +252,8 @@ def calculate(db, document, evidence, report):
                 gaps.append('PROTECTED_FUNDING_UNVERIFIED:' + key)
     funded_totals = {}
     for key, item in funding.items():
+        if key in satisfied_old:
+            continue  # No current-cycle obligation remains to fund a second time.
         role = rows[key]['payment_account']
         if role == 'up.spending' or role not in bound or not dated(item) or item.get('funded') is not True:
             raise EvidenceError('Funding evidence must identify a dated protected bound account')
