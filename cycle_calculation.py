@@ -146,19 +146,27 @@ def calculate(db, document, evidence, report):
     spending = report['up_spending']
     spending['conditional_gaps'] = gaps = []
     spending['deductions'] = deductions = []
+    spending['arithmetic_blockers'] = []
+    spending['qualifications'] = []
+    spending['assured_safe_withdrawal_minor'] = None
     spending['assumptions'] = ['NO_UNOBSERVED_ACTIVITY_DURING_COLLECTION_WINDOW',
         'ACCEPTED_ESTIMATES_AND_OCCURRENCE_PLANS_REMAIN_CONDITIONAL',
-        'COMPLETE_ROW_EVIDENCE_INCLUDES_PRIOR_BANK_AND_SHARED_CATEGORY_SPENDING']
+        'COMPLETE_ROW_EVIDENCE_INCLUDES_PRIOR_BANK_AND_SHARED_CATEGORY_SPENDING',
+        'KNOWN_MATCH_RESIDUALS_ARE_PLANNING_PROTECTIONS_NOT_COMPLETE_ACTUALS',
+        'UNALLOCATED_PAST_ACTUALS_DO_NOT_CREATE_NEW_RECURRING_RESERVES']
+    def unavailable(reason):
+        gaps.append(reason)
+        spending['arithmetic_blockers'] = list(gaps)
+        return report
+    def finite_minor(value):
+        return type(value) is int and 0 <= value < 2**63
     if not proof:
-        gaps.append('NO_CYCLE_CATCHUP_AND_COMPLETENESS_EVIDENCE')
-        return report
+        return unavailable('NO_CYCLE_CATCHUP_AND_COMPLETENESS_EVIDENCE')
     if not db.execute("SELECT 1 FROM sqlite_schema WHERE name='budget_cycle_runs'").fetchone():
-        gaps.append('NO_CYCLE_CATCHUP')
-        return report
+        return unavailable('NO_CYCLE_CATCHUP')
     run = db.execute('SELECT * FROM budget_cycle_runs WHERE run_id=?', (proof.get('runId'),)).fetchone()
     if not run or run['status'] != 'COMPLETE' or run['through_at'] > report['as_of']:
-        gaps.append('CYCLE_PAGINATION_INCOMPLETE_OR_FUTURE')
-        return report
+        return unavailable('CYCLE_PAGINATION_INCOMPLETE_OR_FUTURE')
     accounts = {x['account_id']: dict(x) for x in db.execute('SELECT * FROM budget_cycle_accounts WHERE run_id=?', (run['run_id'],))}
     bound = {key: value['accountId'] for key, value in evidence.get('bindings', {}).items()}
     for role in ('up.spending', 'up.essentials'):
@@ -207,16 +215,24 @@ def calculate(db, document, evidence, report):
         if current['is_deleted']:
             continue
         member = db.execute('SELECT resource_json FROM budget_cycle_members WHERE run_id=? AND transaction_id=?', (run['run_id'], current['transaction_id'])).fetchone()
-        if (current['ordering_conflict'] or not member or member[0] != current['resource_json']
-                or current['currency_code'] != 'AUD'):
+        consistent = not (current['ordering_conflict'] or not member or member[0] != current['resource_json']
+                          or current['currency_code'] != 'AUD')
+        if not consistent:
             gaps.append('TRANSACTION_CHANGED_OR_UNRESOLVED:' + current['transaction_id'])
         if current['amount_base_units'] is not None and current['amount_base_units'] < 0 and 'UP:' + current['transaction_id'] not in aliases:
-            gaps.append('UNCLASSIFIED_UP_DEBIT:' + current['transaction_id'])
+            account = accounts.get(current['account_id'])
+            # A hold predating its balance window is reflected under the explicit
+            # no-window-activity assumption. It is not a second cash deduction.
+            reflected_hold = (consistent and current['up_status'] == 'HELD' and account
+                              and current['created_at'] <= account['balance_window_start'])
+            gaps.append(('UNCLASSIFIED_REFLECTED_UP_HOLD:' if reflected_hold else 'UNCLASSIFIED_UP_DEBIT:')
+                        + current['transaction_id'])
         if current['amount_base_units'] is not None and current['amount_base_units'] > 0 and 'UP:' + current['transaction_id'] not in aliases:
             gaps.append('UNCLASSIFIED_UP_CREDIT_OR_REFUND:' + current['transaction_id'])
     if report['unresolved_matches']:
         gaps.append('UNRESOLVED_OCCURRENCE_MATCHES')
-    ledger_complete = not any(x.startswith(('TRANSACTION_CHANGED_OR_UNRESOLVED:', 'UNCLASSIFIED_UP_', 'UNRESOLVED_OCCURRENCE_MATCHES')) for x in gaps)
+    ledger_complete = not any(x.startswith(('TRANSACTION_CHANGED_OR_UNRESOLVED:', 'UNCLASSIFIED_UP_',
+        'UNCLASSIFIED_REFLECTED_UP_HOLD:', 'UNRESOLVED_OCCURRENCE_MATCHES')) for x in gaps)
     accepted_old = {x['budgetId']: x for x in occurrences(document)
                     if x['kind'] == 'OLD_BANK_PAID' and x['budgetId'] in ('rent', 'tesla-payment')}
     satisfied_old = set()
@@ -238,11 +254,15 @@ def calculate(db, document, evidence, report):
                     for x in matches))
         if row['reserve_class'] == 'inactive_zero':
             row['current_reserve_minor'] = 0
+        elif row['reserve_class'] == 'zero_routine_allowance_incidental_from_discretionary' and row['target_minor'] == 0:
+            row['current_reserve_minor'] = 0
+            row['conditional_reserve_basis'] = 'ACCEPTED_ZERO_ROUTINE_ALLOWANCE_ACTUALS_RETAINED'
         elif paid_old_outside_next:
             row['current_reserve_minor'] = 0
             satisfied_old.add(key)
         elif row['payment_account'] == 'up.spending':
-            row['current_reserve_minor'] = row['remaining_minor'] if complete else None
+            row['current_reserve_minor'] = row['remaining_minor'] if complete else max(0, row['target_minor'] - row['known_committed_spend_minor'])
+            row['conditional_reserve_basis'] = 'COMPLETE_ROW_EVIDENCE' if complete else 'KNOWN_MATCHES_ONLY'
             if not complete:
                 gaps.append('INCOMPLETE_ALL_BANK_CATEGORY:' + key)
         elif originals[key]['bank'] == 'UP' or row['payment_account'] in bound:
@@ -259,9 +279,19 @@ def calculate(db, document, evidence, report):
             raise EvidenceError('Funding evidence must identify a dated protected bound account')
         # Provision allocations remain earmarks, never an extra spending deduction.
         amount = rows[key]['target_minor'] if rows[key]['reserve_class'] == 'provision_component_not_extra_expense' else rows[key]['remaining_minor']
-        if amount is None:
+        next_due = originals[key].get('nextScheduled', '')[:10]
+        if (amount is None and rows[key]['reserve_class'] == 'upcoming_unique_bill_from_essentials'
+                and report['cycle']['start'] <= next_due < report['cycle']['endExclusive']
+                and finite_minor(rows[key]['target_minor'])):
+            # Verify a positive funding proof against the whole accepted current
+            # allocation, not a fabricated paid state or remaining amount.
+            amount = rows[key]['target_minor']
+            rows[key]['funding_check_basis'] = 'FULL_ACCEPTED_ALLOCATION_FUNDING_CHECK'
+            gaps.append('FULL_ACCEPTED_ALLOCATION_FUNDING_CHECK:' + key)
+        if not finite_minor(amount):
             gaps.append('PROTECTED_REMAINING_UNKNOWN:' + key)
         else:
+            rows[key]['funding_check_amount_minor'] = amount
             funded_totals[role] = funded_totals.get(role, 0) + amount
     for role, amount in funded_totals.items():
         if bound[role] not in accounts or accounts[bound[role]]['balance_minor'] < amount:
@@ -283,17 +313,28 @@ def calculate(db, document, evidence, report):
         if row['payment_account'] == 'up.spending' and key not in represented:
             value = row.get('current_reserve_minor')
             deductions.append({'id': 'row:' + key, 'amount_minor': value, 'source': 'ACCEPTED_ROW_REMAINING'})
-    if any(x['amount_minor'] is None for x in deductions):
+    if any(not finite_minor(x['amount_minor']) for x in deductions):
         gaps.append('DEDUCTION_UNKNOWN')
     gaps[:] = sorted(set(gaps))
+    qualification_prefixes = ('INCOMPLETE_ALL_BANK_CATEGORY:', 'UNCLASSIFIED_REFLECTED_UP_HOLD:',
+                              'FULL_ACCEPTED_ALLOCATION_FUNDING_CHECK:')
+    spending['qualifications'] = [x for x in gaps if x.startswith(qualification_prefixes)]
+    spending['arithmetic_blockers'] = [x for x in gaps if not x.startswith(qualification_prefixes)]
+    spending['known_deductions_subtotal_minor'] = sum(x['amount_minor'] for x in deductions if finite_minor(x['amount_minor']))
+    spending['unknown_deduction_ids'] = [x['id'] for x in deductions if not finite_minor(x['amount_minor'])]
+    spending['known_component_planning_subtotal_minor'] = (sum(x['current_reserve_minor'] for x in spending['planning_components'])
+        if all(finite_minor(x['current_reserve_minor']) for x in spending['planning_components']) else None)
+    spending['planning_subtotal_is_spendable'] = False
+    spending['protected_cash_included_minor'] = 0
     spending['conditional_balance_as_of'] = spending['observation']['as_of'] if spending['observation'] else None
-    if not gaps:
+    if not spending['arithmetic_blockers']:
         total = sum(x['amount_minor'] for x in deductions)
         spending['current_reserve_minor'] = total
         spending['conditional_cash_room_minor'] = spending['observation']['available_after_holds_minor'] - total
         spending['qualification'] = 'CONDITIONAL_AT_OBSERVATION_TIME_NOT_ASSURED_OR_BANK_ATOMIC'
     else:
         spending['current_reserve_minor'] = None
+        spending['conditional_cash_room_minor'] = None
     report['actual_total_minor'] = sum(x['actual_minor'] for x in rows.values()) if all(x['actual_minor'] is not None for x in rows.values()) else None
     report['remaining_total_minor'] = sum(x['remaining_minor'] for x in rows.values()) if all(x['remaining_minor'] is not None for x in rows.values()) else None
     return report
