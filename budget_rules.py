@@ -247,7 +247,7 @@ def matched_occurrences(connection, document, evidence, as_of):
 
 
 def calculate(connection, document, evidence, as_of):
-    if not isinstance(evidence, dict) or set(evidence) - {"schema", "bindings", "matches", "cardObservation", "calculation"}:
+    if not isinstance(evidence, dict) or set(evidence) - {"schema", "bindings", "matches", "cardObservation", "cardPlanning", "calculation"}:
         raise EvidenceError("Unrecognised evidence input fields")
     if evidence.get("schema", "nico-budget-evidence/v1") != "nico-budget-evidence/v1":
         raise EvidenceError("Unsupported evidence contract")
@@ -350,7 +350,11 @@ def calculate(connection, document, evidence, as_of):
         "source_dates_and_provenance": {"remaining_inputs": document["remainingDataInputs"], "evidence": document["evidence"]},
         "no_automatic_actions": True}
     from cycle_calculation import calculate as conditional_calculate
-    return conditional_calculate(connection, document, evidence, report)
+    report = conditional_calculate(connection, document, evidence, report)
+    if evidence.get("cardPlanning") is not None:
+        from card_report import build
+        report["commbank_credit"]["planning"] = build(evidence["cardPlanning"], as_of)
+    return report
 
 
 def persist_report(factory, evidence, as_of):

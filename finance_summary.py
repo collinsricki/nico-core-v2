@@ -68,6 +68,112 @@ def codes(values, allowed, other):
     return sorted({v.split(':', 1)[0] if v.split(':', 1)[0] in allowed else other for v in values})
 
 
+def card_planning_display(raw, generated_at, served_at):
+    """Strict nested allowlist; admission/provenance remains the trusted caller's job."""
+    from card_report import exact, require, integer, instant, reference
+    exact(raw, 'schema generated_at currency credit_is_cash observation horizon supported_protections unresolved_occurrences conditional_credit_minor assured_credit_minor minimum_payment_minor repayment_funding_minor hypothetical limitations')
+    require(raw['schema'] == 'nico.card-planning-report/v1' and raw['currency'] == 'AUD')
+    require(raw['credit_is_cash'] is False)
+    require(all(raw[k] is None for k in ('conditional_credit_minor', 'assured_credit_minor',
+                                       'minimum_payment_minor', 'repayment_funding_minor')))
+    generated, served = instant(generated_at), instant(served_at)
+    require(instant(raw['generated_at']) == generated and generated <= served)
+    p, h = raw['observation'], raw['horizon']
+    exact(p, 'available_minor pending_minor balance_minor statement_owing_minor statement_due_date uploaded_at captured_at')
+    integer(p['available_minor']); integer(p['pending_minor'])
+    uploaded, captured = instant(p['uploaded_at']), instant(p['captured_at'], nullable=True)
+    require(uploaded <= generated and (captured is None or captured <= uploaded))
+    exact(h, 'planned_at funding_verified')
+    planned = instant(h['planned_at'])
+    require(uploaded < planned and type(h['funding_verified']) is bool)
+    expired = served >= planned
+    expected = {'OBSERVATION_NOT_REAL_TIME', 'CANDIDATE_SET_NOT_PROVEN_COMPLETE',
+        'NO_ASSURED_OR_LOWER_BOUND_CAPACITY', 'REPAYMENT_FUNDING_NOT_ESTABLISHED',
+        'OBSERVED_PENDING_NOT_REDEDUCTED'}
+    if captured is None:
+        expected.add('UPLOAD_TIME_NOT_BANK_CAPTURE_TIME')
+    if not h['funding_verified']:
+        expected.add('PLANNED_BOUNDARY_NOT_VERIFIED_FUNDING')
+    if generated >= planned:
+        expected.add('PLANNED_HORIZON_EXPIRED')
+    require(type(raw['limitations']) is list and all(type(x) is str for x in raw['limitations'])
+            and len(raw['limitations']) == len(expected) and set(raw['limitations']) == expected)
+    supported, unresolved = raw['supported_protections'], raw['unresolved_occurrences']
+    require(type(supported) is list and len(supported) <= 64)
+    require(type(unresolved) is list and len(unresolved) <= 64)
+    identities = set()
+    for item in supported:
+        exact(item, 'id amount_minor due_at')
+        key = reference(item['id']); require(key not in identities)
+        integer(item['amount_minor'])
+        due = instant(item['due_at'])
+        require(captured is not None and captured <= due < planned)
+        identities.add(key)
+    integer(sum(x['amount_minor'] for x in supported))
+    unresolved_ids = set()
+    for key in unresolved:
+        reference(key); require(key not in identities and key not in unresolved_ids)
+        unresolved_ids.add(key)
+    identities.update(unresolved_ids)
+    scenario = raw['hypothetical']
+    assigned, deductions = {}, []
+    required_assumptions = ['SUPPLIED_AVAILABLE_CREDIT_USED_AS_SCENARIO_START',
+        'NO_OTHER_CHARGES_OR_FEES_BEFORE_PLANNED_BOUNDARY', 'NO_UNOBSERVED_ACTIVITY_AFTER_POSITION',
+        'ENUMERATED_REFLECTION_ROUTE_AND_TIMING_ASSUMPTIONS_HOLD',
+        'PLANNED_BOUNDARY_USED_WITHOUT_GUARANTEED_SALARY_ARRIVAL']
+    if scenario is not None:
+        require(generated < planned)
+        exact(scenario, 'kind amount_minor deductions_minor deductions occurrence_assumptions assumptions assured lower_bound')
+        require(scenario['kind'] == 'BOUNDED_HYPOTHETICAL_NOT_SPENDING_CAPACITY'
+                and scenario['assured'] is False and scenario['lower_bound'] is False
+                and scenario['assumptions'] == required_assumptions)
+        actions = scenario['occurrence_assumptions']
+        exact(actions, 'deduct assume_reflected assume_other_route assume_after_horizon')
+        for action, keys in actions.items():
+            require(type(keys) is list and len(keys) <= 64)
+            for key in keys:
+                reference(key); require(key not in assigned); assigned[key] = action
+        require(identities <= set(assigned) and len(assigned) <= 64)
+        identities.update(assigned)
+        require(all(assigned[x['id']] == 'deduct' for x in supported))
+        require(type(scenario['deductions']) is list and len(scenario['deductions']) <= 64)
+        deduction_ids = set()
+        for item in scenario['deductions']:
+            exact(item, 'id amount_minor'); key = reference(item['id'])
+            require(key not in deduction_ids and assigned.get(key) == 'deduct')
+            integer(item['amount_minor']); deduction_ids.add(key); deductions.append(item)
+        require(deduction_ids == {key for key, action in assigned.items() if action == 'deduct'})
+        amounts = {x['id']: x['amount_minor'] for x in deductions}
+        require(all(amounts[x['id']] == x['amount_minor'] for x in supported))
+        total = integer(sum(x['amount_minor'] for x in deductions))
+        require(total == integer(scenario['deductions_minor'])
+                and integer(p['available_minor'] - total, signed=True)
+                    == integer(scenario['amount_minor'], signed=True))
+    require(len(identities) <= 64)
+    aliases = {key: f'card-protection-{index:02d}'
+               for index, key in enumerate(sorted(identities), 1)}
+    display_scenario = None
+    if scenario is not None and not expired:
+        display_scenario = {'kind': 'BOUNDED_HYPOTHETICAL_NOT_SPENDING_CAPACITY',
+            'amount_minor': scenario['amount_minor'], 'deductions_minor': scenario['deductions_minor'],
+            'deductions': [{'alias': aliases[x['id']], 'amount_minor': x['amount_minor']} for x in deductions],
+            'occurrence_assumptions': {action: [aliases[key] for key in keys]
+                                      for action, keys in scenario['occurrence_assumptions'].items()},
+            'assumption_codes': list(required_assumptions), 'assured': False, 'lower_bound': False}
+    if expired:
+        expected.add('PLANNED_HORIZON_EXPIRED')
+    return {'schema': 'nico.card-planning-display/v1', 'generated_at': generated_at,
+        'observation': {'available_minor': p['available_minor'], 'pending_minor': p['pending_minor'],
+            'uploaded_at': p['uploaded_at'], 'captured_at': p['captured_at'],
+            'state': 'UPLOAD_DATE_ONLY' if captured is None else 'DATED_CAPTURE'},
+        'horizon': {'planned_at': h['planned_at'], 'funding_verified': h['funding_verified'], 'expired': expired},
+        'supported_protections': [{'alias': aliases[x['id']], 'amount_minor': x['amount_minor'],
+            'due_date': datetime.fromisoformat(x['due_at'].replace('Z', '+00:00')).date().isoformat()}
+            for x in supported],
+        'unresolved_count': len(unresolved), 'conditional_credit_minor': None,
+        'assured_credit_minor': None, 'hypothetical': display_scenario, 'limitation_codes': sorted(expected)}
+
+
 def projection(report, report_id, served_at):
     if report['schema'] != 'nico-budget-report/v1' or report['source_hash'] != RULE_HASH:
         raise SummaryUnavailable()
@@ -125,6 +231,8 @@ def projection(report, report_id, served_at):
             'balance_as_of': source_time(scenario['balance_as_of']),
             'assumption_codes': codes(scenario['assumptions'], ASSUMPTIONS, 'OTHER_ASSUMPTION'), 'assured': False}
     card = report['commbank_credit']
+    display_card_planning = (card_planning_display(card['planning'], generated, served_at)
+                             if card.get('planning') is not None else None)
     current_card = card['observation']
     if current_card is not None:
         if current_card['currency'] != 'AUD':
@@ -170,6 +278,8 @@ def projection(report, report_id, served_at):
             'observation_state': card_state, 'credit_is_cash': False},
         'coverage': {'arithmetic_blocker_codes': blockers, 'qualification_codes': qualifiers,
             'assumption_codes': codes(s['assumptions'], ASSUMPTIONS, 'OTHER_ASSUMPTION'), 'limitation_codes': sorted(limits)}}
+    if 'planning' in card:
+        result['card_credit']['planning'] = display_card_planning
     if len(json.dumps(result, allow_nan=False).encode()) > MAX_RESPONSE:
         raise SummaryUnavailable()
     return result
