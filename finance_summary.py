@@ -23,10 +23,12 @@ BLOCKERS = {'NO_CYCLE_CATCHUP_AND_COMPLETENESS_EVIDENCE', 'NO_CYCLE_CATCHUP',
     'CYCLE_PAGINATION_INCOMPLETE_OR_FUTURE', 'CATCHUP_BINDING_MISSING', 'UNRESOLVED_MERCHANT_ROUTE',
     'TRANSACTION_CHANGED_OR_UNRESOLVED', 'UNCLASSIFIED_UP_DEBIT', 'UNCLASSIFIED_UP_CREDIT_OR_REFUND',
     'UNRESOLVED_OCCURRENCE_MATCHES', 'PROTECTED_FUNDING_UNVERIFIED', 'PROTECTED_REMAINING_UNKNOWN',
-    'PROTECTED_ACCOUNT_UNDERFUNDED', 'UNRESOLVED_COMPONENT', 'DEDUCTION_UNKNOWN'}
+    'PROTECTED_ACCOUNT_UNDERFUNDED', 'UNRESOLVED_COMPONENT', 'DEDUCTION_UNKNOWN',
+    'INCREMENTAL_COVERAGE_UNVERIFIED'}
 QUALIFICATIONS = {'FULL_ACCEPTED_ALLOCATION_FUNDING_CHECK', 'INCOMPLETE_ALL_BANK_CATEGORY',
     'OUTSIDE_CYCLE_RENEWAL_ROUTE_UNKNOWN', 'OWNER_DEFERRED_CURRENT_CYCLE_CONTRIBUTION',
-    'UNCLASSIFIED_REFLECTED_UP_HOLD', 'PRIOR_CATEGORY_ALLOCATIONS_PARTIAL_PLANNING_ONLY'}
+    'UNCLASSIFIED_REFLECTED_UP_HOLD', 'PRIOR_CATEGORY_ALLOCATIONS_PARTIAL_PLANNING_ONLY',
+    'INCREMENTAL_OBSERVATIONS_NOT_FULL_CYCLE_PAGINATION'}
 ASSUMPTIONS = {'ASSOCIATED_PENDING_CARD_OBSERVATION_REQUIRES_NO_ADDITIONAL_UP_CASH_IN_THIS_CYCLE',
     'NO_OTHER_CURRENT_CASH_LIABILITY_BEYOND_SUPPORTED_EXISTING_GATES',
     'ACCEPTED_FUTURE_BOOKING_ESTIMATES_AND_UP_ROUTE_APPLY', 'NO_UNOBSERVED_ACTIVITY_SINCE_BALANCE_OBSERVATION',
@@ -193,6 +195,16 @@ def read_selected(root, require_mount, report_id):
     try:
         db.execute('PRAGMA query_only=ON')
         db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        selection_state = 'OWNER_SELECTED'
+        if db.execute("SELECT 1 FROM sqlite_schema WHERE name='budget_daily_selection'").fetchone():
+            daily = db.execute('''SELECT selected_report_id,expires_at,status FROM budget_daily_selection
+                WHERE singleton=1 AND seed_report_id=?''', (report_id,)).fetchone()
+            if daily:
+                if daily[2] == 'CYCLE_EXPIRED' or (daily[1] and datetime.now(timezone.utc) >= datetime.fromisoformat(daily[1])):
+                    raise SummaryUnavailable()
+                if daily[0]:
+                    report_id = daily[0]
+                    selection_state = 'DAILY_GENERATED'
         row = db.execute('''SELECT source_hash,as_of,
             CASE WHEN length(report_json)<=? THEN report_json ELSE NULL END
             FROM budget_reports WHERE report_id=?''', (MAX_REPORT, report_id)).fetchone()
@@ -202,7 +214,9 @@ def read_selected(root, require_mount, report_id):
             parse_constant=lambda _: (_ for _ in ()).throw(SummaryUnavailable()))
         if report['as_of'] != row[1]:
             raise SummaryUnavailable()
-        return projection(report, report_id, datetime.now(timezone.utc).isoformat())
+        result = projection(report, report_id, datetime.now(timezone.utc).isoformat())
+        result['report']['selection_state'] = selection_state
+        return result
     finally:
         db.close()
 

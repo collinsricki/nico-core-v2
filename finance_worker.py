@@ -342,7 +342,7 @@ def event_ready(connection, event_id, now):
 
 
 class FinanceWorker:
-    def __init__(self, connection_factory, client_factory, clock=utcnow, poll_seconds=2):
+    def __init__(self, connection_factory, client_factory, clock=utcnow, poll_seconds=2, report_generator=None):
         self.connection_factory = connection_factory
         self.client_factory = client_factory
         self.clock = clock
@@ -352,6 +352,7 @@ class FinanceWorker:
         self.initialized = False
         self.stopping = threading.Event()
         self.thread = None
+        self.report_generator = report_generator
 
     def start(self):
         self.thread = threading.Thread(target=self._run, name="nico-finance-worker", daemon=True)
@@ -418,6 +419,11 @@ class FinanceWorker:
                 and date(checkpoint["next_attempt_at"]) <= self.clock()):
             self.reconcile(checkpoint)
             reconciled = True
+        if not self.stopping.is_set() and self.report_generator is not None:
+            try:
+                self.report_generator()
+            except Exception:
+                LOG.error("DAILY_REPORT_UNAVAILABLE")
         return {"events_attempted": processed, "reconciliation_attempted": reconciled}
 
     def process_event(self, event):

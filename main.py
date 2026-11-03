@@ -169,8 +169,11 @@ def create_app(*, storage_root=Path("/data"), require_mount=True, secret_provide
     async def lifespan(application):
         worker = None
         if enable_worker:
-            worker = FinanceWorker(lambda: open_database(storage_root, require_mount),
-                                   up_client_factory or configured_client)
+            from daily_report import DailyReports
+            factory = lambda: open_database(storage_root, require_mount)
+            daily = DailyReports(factory, lambda: os.environ.get('SUMMARY_REPORT_ID'))
+            worker = FinanceWorker(factory, up_client_factory or configured_client,
+                                   report_generator=daily.run_once)
             application.state.finance_worker = worker
             worker.start()
         try:
