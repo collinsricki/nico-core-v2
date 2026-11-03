@@ -5,13 +5,73 @@ import logging
 import re
 import time
 from datetime import timedelta
+from urllib.parse import unquote
+from uuid import UUID
 
-from budget_rules import SOURCE_HASH, calculate, canonical, contract
+from budget_rules import SOURCE_HASH, calculate, canonical, contract, matched_occurrences
 from finance_summary import MAX_REPORT, projection
-from finance_worker import date, stamp, transaction, utcnow
+from finance_worker import UpFailure, date, normalize_transaction, stamp, transaction, utcnow
 from planning_report import finish
 
 LOG = logging.getLogger(__name__)
+UUID_TOKEN = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.I)
+COMPACT_UUID_TOKEN = re.compile(r'[0-9a-f]{32}', re.I)
+
+
+def retained_references(*documents):
+    """Parsed declarations, map keys, aliases and provenance. Ambiguous UUID-like
+    tokens conservatively count as dependencies; no serialized-JSON search.
+    """
+    result, visited = set(), 0
+    def visit(value, depth=0):
+        nonlocal visited
+        visited += 1
+        if depth > 64 or visited > 100000:
+            raise ValueError('Retained reference bounds')
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if not isinstance(key, str):
+                    raise ValueError('Unsupported retained reference key')
+                visit(key, depth + 1); visit(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, depth + 1)
+        elif isinstance(value, str):
+            # Source fields are already JSON-decoded. Also recognise UUIDs in
+            # URL references; two bounded decoding passes cover escaped links.
+            variants = (value, unquote(value), unquote(unquote(value)))
+            for scalar in variants:
+                for token in UUID_TOKEN.findall(scalar) + COMPACT_UUID_TOKEN.findall(scalar):
+                    result.add(str(UUID(token)))
+                # A retained provenance field may itself be a JSON document.
+                # Decode its escaped strings before walking the same bounded tree.
+                if scalar.lstrip().startswith(('{', '[')):
+                    try:
+                        nested = json.loads(scalar)
+                    except (ValueError, RecursionError):
+                        raise ValueError('Unparseable retained reference document') from None
+                    visit(nested, depth + 1)
+        elif value is not None and type(value) not in (bool, int, float):
+            raise ValueError('Unsupported retained reference value')
+    for document in documents:
+        visit(document)
+    return result
+
+
+def canonical_row(item):
+    """Independently bind exact provider identity/account/body to projection row."""
+    try:
+        snapshot = normalize_transaction(json.loads(item['resource_json']))
+        if any(snapshot[key] != item[key] for key in ('transaction_id', 'account_id',
+                'up_status', 'amount_base_units', 'currency_code')):
+            return False
+        if date(snapshot['created_at']) != date(item['created_at']):
+            return False
+        if bool(snapshot['settled_at']) != bool(item['settled_at']):
+            return False
+        return not snapshot['settled_at'] or date(snapshot['settled_at']) == date(item['settled_at'])
+    except (UpFailure, KeyError, TypeError, ValueError):
+        return False
 
 
 def schema(db):
@@ -70,6 +130,27 @@ def refreshed_report(db, document, evidence, report, run, now):
     spending['cycle_coverage']['mirror_coverage_verified'] = cursor >= date(run['catchup_until'])
     qualifiers.add('INCREMENTAL_OBSERVATIONS_NOT_FULL_CYCLE_PAGINATION')
 
+    # Exercise the actual accepted validator in this read transaction. A report
+    # match cannot grant admission merely because a caller injected its shape.
+    verified_matches, verified_unresolved = matched_occurrences(db, document, evidence, stamp(now))
+    if (canonical(verified_matches) != canonical(report['matched_occurrences'])
+            or canonical(verified_unresolved) != canonical(report.get('unresolved_matches', []))):
+        raise ValueError('Report and accepted matcher disagree')
+    matched = {}
+    for match in verified_matches:
+        for alias in match.get('resource_aliases', [match['resource_key']]):
+            if alias.startswith('UP:'):
+                identity = alias[3:]
+                if identity in matched and matched[identity] != match:
+                    raise ValueError('Ambiguous accepted resource match')
+                matched[identity] = match
+    # Retained declarations matter even when validation removes a deleted match.
+    retained_dependencies = retained_references(document, evidence, verified_matches, verified_unresolved,
+        spending.get('planning_components', []), spending.get('prior_category_planning_allocations', []),
+        report['protected_essentials_savers'])
+    excluded_deleted_holds = 0
+    resolved_later_matches = 0
+
     # The old completeness declaration does not cover new activity, including
     # changes created after the reconciliation collection boundary via webhooks.
     for count, item in enumerate(db.execute('SELECT * FROM transactions WHERE created_at>=? AND created_at<? LIMIT 10001',
@@ -77,13 +158,57 @@ def refreshed_report(db, document, evidence, report, run, now):
         if count == 10000:
             raise ValueError('Bounded local observation limit')
         if item['account_id'] not in bound.values():
+            if not canonical_row(item):
+                raise ValueError('Unbound projection disagrees with provider account')
             continue
         member = db.execute('SELECT resource_json FROM budget_cycle_members '
                             'WHERE run_id=? AND transaction_id=?',
                             (base['run_id'], item['transaction_id'])).fetchone()
-        if item['ordering_conflict'] or item['is_deleted'] or not member or member[0] != item['resource_json']:
+        identity = item['transaction_id']
+        match = matched.get(identity)
+        observed_at = snapshots[item['account_id']]['observed_at']
+        observation_cut = min(date(run['started_at']), date(observed_at), now)
+        if item['is_deleted'] and member and not item['ordering_conflict']:
+            initial = json.loads(member[0])
+            attributes = initial.get('attributes', {})
+            initial_account = initial.get('relationships', {}).get('account', {}).get('data', {})
+            if (attributes.get('status') == 'HELD' and item['up_status'] == 'HELD'
+                    and item['settled_at'] is None and item['last_event_type'] == 'TRANSACTION_DELETED'
+                    and item['last_event_at'] and date(item['last_event_at']) <= observation_cut
+                    and type(item['amount_base_units']) is int and item['amount_base_units'] < 0
+                    and item['currency_code'] == 'AUD'
+                    and attributes.get('amount', {}).get('valueInBaseUnits') == item['amount_base_units']
+                    and attributes.get('amount', {}).get('currencyCode') == 'AUD'
+                    and initial_account.get('id') == item['account_id']
+                    and member[0] == item['resource_json'] and canonical_row(item) and match is None
+                    and identity not in retained_dependencies):
+                excluded_deleted_holds += 1
+                continue
+        declaration = any(entry.get('source') == 'UP' and entry.get('transactionId') == identity
+            and entry.get('occurrenceId') == match['occurrence_id']
+            and entry.get('kind') == match['kind'] and entry.get('budgetId') == match['budget_id']
+            for entry in evidence.get('matches', [])) if match is not None else False
+        resolved_new = (not member and not item['is_deleted'] and not item['ordering_conflict']
+            and match is not None and match['source'] == 'UP' and declaration and canonical_row(item)
+            and match['kind'] in ('EXPENSE', 'INTERNAL_TRANSFER', 'NON_BUDGET_CREDIT')
+            and item['currency_code'] == 'AUD' and type(item['amount_base_units']) is int
+            and match['amount_minor'] == abs(item['amount_base_units'])
+            and match['status'] == item['up_status']
+            and date(item['created_at']) <= min(date(run['catchup_until']), observation_cut)
+            and (not item['last_event_at'] or date(item['last_event_at']) <= observation_cut)
+            and (item['up_status'] != 'SETTLED' or
+                 (item['settled_at'] and date(item['settled_at']) <= observation_cut))
+            and (match['kind'] != 'EXPENSE' or item['amount_base_units'] < 0)
+            and (match['kind'] != 'INTERNAL_TRANSFER' or item['amount_base_units'] != 0)
+            and (match['kind'] != 'NON_BUDGET_CREDIT' or
+                 (item['amount_base_units'] > 0 and item['up_status'] == 'SETTLED' and match['budget_id'] is None)))
+        if resolved_new:
+            resolved_later_matches += 1
+            for code in ('TRANSACTION_CHANGED_OR_UNRESOLVED:', 'UNCLASSIFIED_UP_DEBIT:', 'UNCLASSIFIED_UP_CREDIT_OR_REFUND:'):
+                gaps.discard(code + identity)
+        if item['ordering_conflict'] or item['is_deleted'] or (not member and not resolved_new) or (member and member[0] != item['resource_json']):
             gaps.add('TRANSACTION_CHANGED_OR_UNRESOLVED:' + item['transaction_id'])
-        if not member:
+        if not member and not resolved_new:
             if item['amount_base_units'] is None or item['currency_code'] != 'AUD':
                 gaps.add('TRANSACTION_CHANGED_OR_UNRESOLVED:' + item['transaction_id'])
             elif item['amount_base_units'] < 0:
@@ -132,7 +257,9 @@ def refreshed_report(db, document, evidence, report, run, now):
            spending.get('prior_category_planning_allocations', []))
     report['daily_generation'] = {'reconciliation_id': run['run_id'],
         'reconciliation_through_at': run['catchup_until'],
-        'historical_evidence_not_redated': True, 'cycle_expires_at': base['end_at']}
+        'historical_evidence_not_redated': True, 'cycle_expires_at': base['end_at'],
+        'excluded_deleted_holds_count': excluded_deleted_holds,
+        'resolved_later_matches_count': resolved_later_matches}
     return report, base['end_at']
 
 

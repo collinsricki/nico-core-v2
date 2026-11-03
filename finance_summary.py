@@ -184,7 +184,7 @@ def _pairs(items):
     return result
 
 
-def read_selected(root, require_mount, report_id):
+def read_selected_record(root, require_mount, report_id, *, include_evidence=False):
     root = Path(root)
     directory, database = root / 'nico-ingress', root / 'nico-ingress/events.sqlite3'
     if (root.is_symlink() or directory.is_symlink() or database.is_symlink()
@@ -195,6 +195,7 @@ def read_selected(root, require_mount, report_id):
     try:
         db.execute('PRAGMA query_only=ON')
         db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        db.execute('BEGIN')  # Selector and report must belong to one read snapshot.
         selection_state = 'OWNER_SELECTED'
         if db.execute("SELECT 1 FROM sqlite_schema WHERE name='budget_daily_selection'").fetchone():
             daily = db.execute('''SELECT selected_report_id,expires_at,status FROM budget_daily_selection
@@ -205,20 +206,33 @@ def read_selected(root, require_mount, report_id):
                 if daily[0]:
                     report_id = daily[0]
                     selection_state = 'DAILY_GENERATED'
+        evidence_sql = ',CASE WHEN length(evidence_json)<=? THEN evidence_json ELSE NULL END' if include_evidence else ''
+        parameters = (MAX_REPORT, MAX_REPORT, report_id) if include_evidence else (MAX_REPORT, report_id)
         row = db.execute('''SELECT source_hash,as_of,
-            CASE WHEN length(report_json)<=? THEN report_json ELSE NULL END
-            FROM budget_reports WHERE report_id=?''', (MAX_REPORT, report_id)).fetchone()
+            CASE WHEN length(report_json)<=? THEN report_json ELSE NULL END'''
+            + evidence_sql + ' FROM budget_reports WHERE report_id=?', parameters).fetchone()
         if not row or row[0] != RULE_HASH or row[2] is None or len(row[2].encode()) > MAX_REPORT:
             raise SummaryUnavailable()
         report = json.loads(row[2], object_pairs_hook=_pairs,
             parse_constant=lambda _: (_ for _ in ()).throw(SummaryUnavailable()))
         if report['as_of'] != row[1]:
             raise SummaryUnavailable()
-        result = projection(report, report_id, datetime.now(timezone.utc).isoformat())
-        result['report']['selection_state'] = selection_state
-        return result
+        evidence = None
+        if include_evidence:
+            if row[3] is None or len(row[3].encode()) > MAX_REPORT:
+                raise SummaryUnavailable()
+            evidence = json.loads(row[3], object_pairs_hook=_pairs,
+                parse_constant=lambda _: (_ for _ in ()).throw(SummaryUnavailable()))
+        return report, evidence, report_id, selection_state
     finally:
         db.close()
+
+
+def read_selected(root, require_mount, report_id):
+    report, _, selected, selection_state = read_selected_record(root, require_mount, report_id)
+    result = projection(report, selected, datetime.now(timezone.utc).isoformat())
+    result['report']['selection_state'] = selection_state
+    return result
 
 
 def install_summary_route(application, *, storage_root=Path('/data'), require_mount=True, settings_provider=None):
@@ -227,8 +241,7 @@ def install_summary_route(application, *, storage_root=Path('/data'), require_mo
     provider = settings_provider or settings
     def error(status, code):
         return JSONResponse({'error': {'code': code}}, status_code=status, headers=HEADERS)
-    @application.api_route('/api/v1/summary', methods=['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], include_in_schema=False)
-    async def summary(request: Request):
+    async def serve(request: Request, reader):
         if request.method != 'GET':
             return error(405, 'UNSUPPORTED_METHOD')
         token, selected = provider()
@@ -250,7 +263,17 @@ def install_summary_route(application, *, storage_root=Path('/data'), require_mo
             return error(400, 'UNSUPPORTED_REQUEST')
         try:
             async with asyncio.timeout(3):
-                payload = await run_in_threadpool(read_selected, storage_root, require_mount, selected)
+                payload = await run_in_threadpool(reader, storage_root, require_mount, selected)
             return JSONResponse(payload, headers=HEADERS)
         except (SummaryUnavailable, OSError, sqlite3.Error, ValueError, KeyError, TypeError, RecursionError, TimeoutError):
             return error(503, 'SUMMARY_UNAVAILABLE')
+
+    methods = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']
+    @application.api_route('/api/v1/summary', methods=methods, include_in_schema=False)
+    async def summary(request: Request):
+        return await serve(request, read_selected)
+
+    from finance_budget import read_budget
+    @application.api_route('/api/v1/budget', methods=methods, include_in_schema=False)
+    async def budget(request: Request):
+        return await serve(request, read_budget)
