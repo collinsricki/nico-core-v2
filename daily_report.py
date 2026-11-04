@@ -82,9 +82,11 @@ def schema(db):
     db.execute('''CREATE TABLE IF NOT EXISTS budget_daily_jobs (
         seed_report_id TEXT NOT NULL,reconciliation_id TEXT NOT NULL,report_id TEXT NOT NULL,
         generated_at TEXT NOT NULL,PRIMARY KEY(seed_report_id,reconciliation_id))''')
+    from balance_refresh import report_jobs_schema
+    report_jobs_schema(db)
 
 
-def refreshed_report(db, document, evidence, report, run, now):
+def refreshed_report(db, document, evidence, report, run, now, balance_batch=None):
     """Advance supported observation fields, never an evidence/pagination timestamp."""
     spending = report['up_spending']
     base = db.execute('SELECT * FROM budget_cycle_runs WHERE run_id=?',
@@ -96,6 +98,20 @@ def refreshed_report(db, document, evidence, report, run, now):
     bound = {role: item['accountId'] for role, item in evidence['bindings'].items()}
     snapshots = {row['account_id']: row for row in db.execute(
         'SELECT * FROM balance_snapshots WHERE run_id=?', (run['run_id'],))}
+    newer_balance_only = False
+    if balance_batch:
+        for identity in bound.values():
+            current = snapshots.get(identity)
+            candidate = balance_batch['accounts'].get(identity)
+            if not candidate or candidate['currency'] != 'AUD':
+                raise ValueError('Bound account missing from balance batch')
+            if not current or date(balance_batch['observed_at']) < date(current['observed_at']):
+                raise ValueError('Balance batch regressed')
+            # Equal clock readings (even equal amounts) do not turn an independent
+            # accounts GET into a verified transaction reconciliation observation.
+            newer_balance_only |= balance_batch['source_kind'] == 'ACCOUNTS_GET'
+            snapshots[identity] = {'account_id': identity, 'currency_code': candidate['currency'],
+                'balance_base_units': candidate['balance_minor'], 'observed_at': balance_batch['observed_at']}
     for role, identity in bound.items():
         row = snapshots.get(identity)
         if (not row or row['currency_code'] != 'AUD' or date(row['observed_at']) > now
@@ -105,6 +121,9 @@ def refreshed_report(db, document, evidence, report, run, now):
             'currency': 'AUD', 'as_of': row['observed_at'], 'source': 'existing_render_balance_snapshot',
             'currentness': 'OBSERVATION_DATE_ONLY',
             'coverage': 'INCREMENTAL_MIRROR_NOT_FULL_CYCLE_PAGINATION'}
+        if newer_balance_only:
+            observation.update(source='existing_render_accounts_only_batch',
+                               coverage='BALANCE_ONLY_NOT_TRANSACTION_COVERAGE')
         if role == 'up.spending':
             spending['observation'] = observation
         else:
@@ -113,6 +132,8 @@ def refreshed_report(db, document, evidence, report, run, now):
         raise ValueError('Spending binding required')
 
     gaps = set(spending['arithmetic_blockers'])
+    if newer_balance_only:
+        gaps.add('INCREMENTAL_COVERAGE_UNVERIFIED')
     qualifiers = set(spending['qualifications'])
     # These runs record actual completed reconciliation, not just ordering. Even a
     # continuous chain is only mirror coverage, never new full-cycle pagination.
@@ -260,6 +281,10 @@ def refreshed_report(db, document, evidence, report, run, now):
         'historical_evidence_not_redated': True, 'cycle_expires_at': base['end_at'],
         'excluded_deleted_holds_count': excluded_deleted_holds,
         'resolved_later_matches_count': resolved_later_matches}
+    if balance_batch:
+        report['daily_generation']['balance_batch_id'] = balance_batch['batch_id']
+        report['daily_generation']['balance_observed_at'] = balance_batch['observed_at']
+        report['daily_generation']['balance_only_not_transaction_coverage'] = newer_balance_only
     return report, base['end_at']
 
 
@@ -304,15 +329,22 @@ class DailyReports:
                 run = db.execute("SELECT * FROM reconciliation_runs WHERE status='OBSERVED' ORDER BY finished_at DESC LIMIT 1").fetchone()
                 if not run or date(run['finished_at']) > now:
                     return
-                if db.execute('SELECT 1 FROM budget_daily_jobs WHERE seed_report_id=? AND reconciliation_id=?',
-                              (seed, run['run_id'])).fetchone():
+                from balance_refresh import selected as selected_balance
+                balance_batch = selected_balance(db, now)
+                balance_key = balance_batch['batch_id'] if balance_batch else ''
+                if db.execute('''SELECT 1 FROM budget_balance_jobs WHERE seed_report_id=?
+                    AND reconciliation_id=? AND balance_batch_id=?''',
+                              (seed, run['run_id'], balance_key)).fetchone():
+                    return
+                if not balance_batch and db.execute('SELECT 1 FROM budget_daily_jobs WHERE seed_report_id=? AND reconciliation_id=?',
+                                                    (seed, run['run_id'])).fetchone():
                     return
                 stored = db.execute('SELECT raw_json FROM budget_sources WHERE source_hash=?', (SOURCE_HASH,)).fetchone()
                 if not stored:
                     raise ValueError('Accepted rule map missing')
                 document = contract(stored[0])
                 report = calculate(db, document, evidence, stamp(now))
-                report, expiry = refreshed_report(db, document, evidence, report, run, now)
+                report, expiry = refreshed_report(db, document, evidence, report, run, now, balance_batch)
                 projection(report, '0' * 64, stamp(now))  # Exact existing allowlist validation.
                 payload = canonical(report)
                 if len(payload.encode()) > MAX_REPORT:
@@ -320,7 +352,9 @@ class DailyReports:
                 identity = hashlib.sha256(canonical({'report': report, 'evidence': evidence}).encode()).hexdigest()
                 db.execute('INSERT OR IGNORE INTO budget_reports VALUES(?,?,?,?,?)',
                            (identity, SOURCE_HASH, stamp(now), canonical(evidence), payload))
-                db.execute('INSERT INTO budget_daily_jobs VALUES(?,?,?,?)', (seed, run['run_id'], identity, stamp(now)))
+                db.execute('INSERT OR IGNORE INTO budget_daily_jobs VALUES(?,?,?,?)', (seed, run['run_id'], identity, stamp(now)))
+                db.execute('INSERT INTO budget_balance_jobs VALUES(?,?,?,?,?)',
+                           (seed, run['run_id'], balance_key, identity, stamp(now)))
                 db.execute('''UPDATE budget_daily_selection SET selected_report_id=?,last_reconciliation_id=?,
                     expires_at=?,status='READY',next_attempt_at=NULL,failure_count=0 WHERE singleton=1''',
                            (identity, run['run_id'], expiry))

@@ -381,8 +381,13 @@ class FinanceWorker:
 
     def initialize(self):
         ensure_schema(self.connection_factory, self.clock())
+        from balance_refresh import schema as balance_schema
+        with transaction(self.connection_factory) as connection:
+            balance_schema(connection, self.clock())
         self.client = self.client_factory()
         self.auth_paused = self.client is None
+        if self._read("SELECT status FROM balance_refresh_state WHERE singleton=1")[0]['status'] == 'AUTH_REQUIRED':
+            self.auth_paused = True
         self.initialized = True
         self._control("AUTH_REQUIRED" if self.auth_paused else "RUNNING")
 
@@ -419,6 +424,11 @@ class FinanceWorker:
                 and date(checkpoint["next_attempt_at"]) <= self.clock()):
             self.reconcile(checkpoint)
             reconciled = True
+        from balance_refresh import due as balance_due, collect as collect_balances
+        if not self.stopping.is_set() and not self.auth_paused:
+            balance_state = balance_due(self)
+            if balance_state:
+                collect_balances(self, balance_state)
         if not self.stopping.is_set() and self.report_generator is not None:
             try:
                 self.report_generator()
@@ -532,6 +542,9 @@ class FinanceWorker:
                     next_attempt_at=?,failure_count=0,last_error=?,attention_required=? WHERE singleton=1""",
                     (until, stamp(self.clock()), stamp(started + timedelta(seconds=DAY_SECONDS)),
                      "PROJECTION_REVIEW_REQUIRED" if partial else None, int(partial)))
+                if not partial:
+                    from balance_refresh import reuse_daily_isolated
+                    reuse_daily_isolated(connection, run_id)
         except UpFailure as error:
             count = checkpoint["failure_count"] + 1
             due = None if error.kind == "permanent" else stamp(self.clock() + timedelta(seconds=delay(count, error.retry_after)))
