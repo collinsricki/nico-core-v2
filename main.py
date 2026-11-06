@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -172,8 +173,15 @@ def create_app(*, storage_root=Path("/data"), require_mount=True, secret_provide
             from daily_report import DailyReports
             factory = lambda: open_database(storage_root, require_mount)
             daily = DailyReports(factory, lambda: os.environ.get('SUMMARY_REPORT_ID'))
+            backup_callback = None
+            try:
+                from backup_startup import build_callback
+                backup_callback = build_callback(factory, storage_root, os.environ)
+            except Exception:
+                logging.getLogger(__name__).error('BACKUP_CONFIGURATION_UNAVAILABLE')
             worker = FinanceWorker(factory, up_client_factory or configured_client,
-                                   report_generator=daily.run_once)
+                                   report_generator=daily.run_once,
+                                   backup_callback=backup_callback)
             application.state.finance_worker = worker
             worker.start()
         try:

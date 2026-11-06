@@ -342,7 +342,7 @@ def event_ready(connection, event_id, now):
 
 
 class FinanceWorker:
-    def __init__(self, connection_factory, client_factory, clock=utcnow, poll_seconds=2, report_generator=None):
+    def __init__(self, connection_factory, client_factory, clock=utcnow, poll_seconds=2, report_generator=None, backup_callback=None):
         self.connection_factory = connection_factory
         self.client_factory = client_factory
         self.clock = clock
@@ -353,6 +353,7 @@ class FinanceWorker:
         self.stopping = threading.Event()
         self.thread = None
         self.report_generator = report_generator
+        self.backup_callback = backup_callback  # No default factory or credential binding.
 
     def start(self):
         self.thread = threading.Thread(target=self._run, name="nico-finance-worker", daemon=True)
@@ -366,6 +367,13 @@ class FinanceWorker:
             close = getattr(self.client, "close", None)
             if close:
                 close()
+        if self.backup_callback is not None and (not self.thread or not self.thread.is_alive()):
+            close = getattr(self.backup_callback, "close", None)
+            if close:
+                try:
+                    close()
+                except Exception:
+                    LOG.error("BACKUP_SESSION_CLOSE_FAILED")
 
     def _run(self):
         failures = 0
@@ -434,6 +442,13 @@ class FinanceWorker:
                 self.report_generator()
             except Exception:
                 LOG.error("DAILY_REPORT_UNAVAILABLE")
+        if not self.stopping.is_set() and self.backup_callback is not None:
+            try:
+                result = self.backup_callback()
+                if result.get("status") == "FAILED":
+                    LOG.error("BACKUP_JOB_FAILED")
+            except Exception:
+                LOG.error("BACKUP_JOB_UNAVAILABLE")
         return {"events_attempted": processed, "reconciliation_attempted": reconciled}
 
     def process_event(self, event):
